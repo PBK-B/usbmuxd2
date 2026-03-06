@@ -9,29 +9,27 @@
 #define WIFIDevice_hpp
 
 #include "Device.hpp"
-#include <libgeneral/Manager.hpp>
 #include <libimobiledevice/libimobiledevice.h>
 #include <libimobiledevice/heartbeat.h>
-#include <libimobiledevice/lockdown.h>
-#include <plist/plist.h>
 
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <vector>
 
 class WIFIDeviceManager;
-class WIFIDevice : public Device, tihmstar::Manager {
+class WIFIConnectionSession;
+class WIFIDevice : public Device {
     WIFIDeviceManager *_parent;
     std::weak_ptr<WIFIDevice> _selfref;
     std::vector<std::string> _ipaddr;
     std::string _serviceName;
     uint32_t _interfaceIndex;
-    heartbeat_client_t _hbclient;
-    plist_t _hbrsp;
-    idevice_t _idev;
+    std::shared_ptr<WIFIConnectionSession> _session;
+    std::mutex _sessionLck;
+    bool _rediscoverOnDestruct;
 
-    virtual bool loopEvent() override;
-    virtual void beforeLoop() override;
-    virtual void afterLoop() noexcept override;
+    bool isPairingDevice() const noexcept;
 
 public:
     WIFIDevice(Muxer *mux, WIFIDeviceManager *parent, std::string uuid, std::vector<std::string> ipaddr, std::string serviceName, uint32_t interfaceIndex = 0);
@@ -42,10 +40,15 @@ public:
     virtual void kill() noexcept override;
     void deconstruct() noexcept;
     void startLoop();
+    void ensureSession();
+    void stopSession(bool joinThread = true) noexcept;
+    void updateDiscoveryInfo(std::vector<std::string> ipaddr, std::string serviceName, uint32_t interfaceIndex);
+    void setRediscoverOnDestruct(bool enabled) noexcept;
     virtual void start_connect(uint16_t dport, std::shared_ptr<Client> cli) override;
 
     friend class Muxer;
     friend class WIFIDeviceManager;
+    friend class WIFIConnectionSession;
 };
 
 #endif /* WIFIDevice_hpp */

@@ -15,6 +15,8 @@
 
 #include <libgeneral/DeliveryEvent.hpp>
 
+#include <atomic>
+#include <chrono>
 #include <map>
 
 #include <poll.h>
@@ -111,6 +113,13 @@ private:
     std::vector<struct pollfd> _pfds;
     std::map<DNSServiceRef, DNSServiceRef> _linkedClients;
     std::map<DNSServiceRef, std::vector<std::string>> _clientAddrs;
+    std::atomic<bool> _shouldRestart;
+    std::atomic<bool> _isStopping;
+
+    void init_mdns();
+    void cleanup_mdns() noexcept;
+    void rebuild_pollfds() noexcept;
+    void request_restart() noexcept;
 
     virtual bool loopEvent() override;
     virtual void stopAction() noexcept override;
@@ -121,6 +130,7 @@ public:
     virtual ~WIFIDeviceManager() override;
         
     void device_add(std::shared_ptr<WIFIDevice> dev, bool notify = true);
+    void request_device_rediscovery(const char *serial, const char *serviceName) noexcept;
     
     friend WIFIDevice;
     friend void browse_reply(DNSServiceRef sdref, const DNSServiceFlags flags, uint32_t ifIndex, DNSServiceErrorType errorCode, const char *replyName, const char *replyType, const char *replyDomain, void *context) noexcept;

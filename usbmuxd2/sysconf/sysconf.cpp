@@ -352,6 +352,7 @@ Config::Config() :
 //config
 doPreflight(false),
 allowHeartlessWifi(false),
+retryWifiSession(false),
 enableWifiDeviceManager(false),
 enableUSBDeviceManager(false),
 //commandline

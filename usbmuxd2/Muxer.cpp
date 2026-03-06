@@ -33,13 +33,14 @@
 #define MAXID (INT_MAX/2)
 #define INVALID_ID (MAXID + 1)
 
-Muxer::Muxer(bool doPreflight, bool allowHeartlessWifi)
+Muxer::Muxer(bool doPreflight, bool allowHeartlessWifi, bool retryWifiSession)
 : _climgr(nullptr), _usbdevmgr(nullptr), _wifidevmgr(nullptr)
-, _doPreflight(doPreflight), _allowHeartlessWifi(allowHeartlessWifi)
+, _doPreflight(doPreflight), _allowHeartlessWifi(allowHeartlessWifi), _retryWifiSession(retryWifiSession)
 , _newid(1)
 {
-    info("Starting Muxer: preflight=%s allowHeartlessWifi=%s", doPreflight ? "YES" : "NO"
-                                                             , allowHeartlessWifi ? "YES" : "NO");
+    info("Starting Muxer: preflight=%s allowHeartlessWifi=%s retryWifiSession=%s", doPreflight ? "YES" : "NO"
+                                                                                   , allowHeartlessWifi ? "YES" : "NO"
+                                                                                   , retryWifiSession ? "YES" : "NO");
 }
 
 Muxer::~Muxer(){
@@ -208,6 +209,7 @@ void Muxer::delete_device(uint8_t bus, uint8_t address) noexcept {
 
 void Muxer::delete_wifi_pairing_device_with_ip(std::vector<std::string> ipaddrs) noexcept{
 #if defined(HAVE_WIFI_AVAHI) || defined(HAVE_WIFI_MDNS)
+    int devid = INVALID_ID;
     guardWrite(_devicesGuard);
     for (auto dev : _devices){
         if (dev->_conntype == Device::MUXCONN_WIFI) {
@@ -215,13 +217,47 @@ void Muxer::delete_wifi_pairing_device_with_ip(std::vector<std::string> ipaddrs)
             for (auto nip : ipaddrs) {
                 if (strncmp(wifidev->_serial, "WIFIPAIR", sizeof("WIFIPAIR")-1) == 0 &&
                     std::find(wifidev->_ipaddr.begin(), wifidev->_ipaddr.end(), nip) != wifidev->_ipaddr.end()) {
+                    devid = dev->_id;
                     _devices.erase(dev);
-                    return;
+                    goto done;
                 }
             }
         }
     }
+done:
+    if (devid != INVALID_ID) {
+        notify_device_remove(devid);
+    }
 #endif //defined(HAVE_WIFI_AVAHI) || defined(HAVE_WIFI_MDNS)
+}
+
+void Muxer::delete_wifi_device_with_serial(const std::string &serial) noexcept{
+#if defined(HAVE_WIFI_AVAHI) || defined(HAVE_WIFI_MDNS)
+    int devid = INVALID_ID;
+    guardWrite(_devicesGuard);
+    for (auto dev : _devices){
+        if (dev->_conntype == Device::MUXCONN_WIFI && serial == dev->_serial) {
+            devid = dev->_id;
+            _devices.erase(dev);
+            break;
+        }
+    }
+    if (devid != INVALID_ID) {
+        notify_device_remove(devid);
+    }
+#endif //defined(HAVE_WIFI_AVAHI) || defined(HAVE_WIFI_MDNS)
+}
+
+std::shared_ptr<WIFIDevice> Muxer::get_wifi_device_with_serial(const std::string &serial) noexcept{
+#if defined(HAVE_WIFI_AVAHI) || defined(HAVE_WIFI_MDNS)
+    guardRead(_devicesGuard);
+    for (auto dev : _devices){
+        if (dev->_conntype == Device::MUXCONN_WIFI && serial == dev->_serial) {
+            return std::static_pointer_cast<WIFIDevice>(dev);
+        }
+    }
+#endif //defined(HAVE_WIFI_AVAHI) || defined(HAVE_WIFI_MDNS)
+    return nullptr;
 }
 
 bool Muxer::have_usb_device(uint8_t bus, uint8_t address) noexcept {
@@ -267,6 +303,14 @@ bool Muxer::have_wifi_device_with_ip(std::vector<std::string> ipaddrs) noexcept{
     }
 #endif //defined(HAVE_WIFI_AVAHI) || defined(HAVE_WIFI_MDNS)
     return false;
+}
+
+bool Muxer::allowHeartlessWifi() const noexcept{
+    return _allowHeartlessWifi;
+}
+
+bool Muxer::retryWifiSession() const noexcept{
+    return _retryWifiSession;
 }
 
 

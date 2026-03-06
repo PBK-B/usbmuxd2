@@ -25,6 +25,7 @@ public:
     //config
     bool doPreflight;
     bool allowHeartlessWifi;
+    bool retryWifiSession;
     bool enableWifiDeviceManager;
     bool enableUSBDeviceManager;
 

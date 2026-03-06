@@ -182,6 +182,7 @@ static void usage(){
     printf("                  \t\tdevices connected (always works) and exit.\n");
     printf("      --debug\t\t\tEnable debug logging\n");
     printf("      --allow-heartless-wifi\tAllow WIFI devices without heartbeat to be listed (needed for WIFI pairing)\n");
+    printf("      --retry-wifi-session\tRetry WIFI session recovery while heartless WIFI device remains listed\n");
     printf("      --no-usb\t\t\tDo not start USBDeviceManager\n");
     printf("      --no-wifi\t\t\tDo not start WIFIDeviceManager\n");
     printf("\n");
@@ -204,6 +205,7 @@ static void parse_opts(int argc, const char **argv){
         {"enable-exit",             no_argument,        NULL, 'z'},
         
         {"allow-heartless-wifi",    no_argument,        NULL,  0 },
+        {"retry-wifi-session",     no_argument,        NULL,  0 },
         {"debug",                   no_argument,        NULL,  0 },
         {"no-usb",                  optional_argument,  NULL,  0 },
         {"no-wifi",                 optional_argument,  NULL,  0 },
@@ -227,6 +229,8 @@ static void parse_opts(int argc, const char **argv){
                 
                 if (curopt == "allow-heartless-wifi") {
                     gConfig->allowHeartlessWifi = true;
+                }else if (curopt == "retry-wifi-session") {
+                    gConfig->retryWifiSession = true;
                 }else if (curopt == "debug") {
                     gConfig->debugLevel++;
                 }else if (curopt == "no-usb") {
@@ -387,9 +391,14 @@ int main(int argc, const char * argv[]) {
     if (!gConfig->doPreflight){
         info("Preflight disabled by config or commandline!");
     }
+
+    if (gConfig->retryWifiSession && !gConfig->allowHeartlessWifi) {
+        warning("Ignoring --retry-wifi-session because --allow-heartless-wifi is disabled");
+        gConfig->retryWifiSession = false;
+    }
     
     //starting
-    mux = new Muxer(gConfig->doPreflight, gConfig->allowHeartlessWifi);
+    mux = new Muxer(gConfig->doPreflight, gConfig->allowHeartlessWifi, gConfig->retryWifiSession);
 
     try{
         mux->spawnClientManager();

@@ -18,6 +18,7 @@
 #include <avahi-common/malloc.h>
 #include <avahi-common/address.h>
 
+#include <chrono>
 #include <string.h>
 
 #pragma mark avahi_callback definitions
@@ -32,19 +33,15 @@ void avahi_resolve_callback(AvahiServiceResolver *r, AvahiIfIndex interface, Ava
 
 WIFIDeviceManager::WIFIDeviceManager(Muxer *mux)
 : DeviceManager(mux)
+, _simple_poll(nullptr)
+, _avahi_client(nullptr)
+, _avahi_sb(nullptr)
+, _avahi_sb2(nullptr)
+, _shouldRestart(false)
+, _isStopping(false)
 {
-   int err = 0;
    debug("WIFIDeviceManager avahi-client");
-
-   assure(_simple_poll = avahi_simple_poll_new());
-
-   retassure(_avahi_client = avahi_client_new(avahi_simple_poll_get(_simple_poll), (AvahiClientFlags)0, avahi_client_callback, this, &err),
-       "Failed to start avahi_client with error=%d. Is the daemon running?",err);
-   assure(!err);
-
-   assure(_avahi_sb = avahi_service_browser_new(_avahi_client, AVAHI_IF_UNSPEC, AVAHI_PROTO_UNSPEC, "_apple-mobdev2._tcp", NULL, (AvahiLookupFlags)0, avahi_browse_callback, this));
-   assure(_avahi_sb2 = avahi_service_browser_new(_avahi_client, AVAHI_IF_UNSPEC, AVAHI_PROTO_UNSPEC, "_remotepairing-manual-pairing._tcp", NULL, (AvahiLookupFlags)0, avahi_browse_callback, this));
-   debug("WIFIDeviceManager created avahi service_browser");
+   init_avahi();
 
     _devReaperThread = std::thread([this]{
         reaper_runloop();
@@ -68,27 +65,57 @@ WIFIDeviceManager::~WIFIDeviceManager(){
     _reapDevices.kill();
     _devReaperThread.join();
 
-    safeFreeCustom(_avahi_sb,avahi_service_browser_free);
-    safeFreeCustom(_avahi_sb2,avahi_service_browser_free);
-    safeFreeCustom(_avahi_client,avahi_client_free);
-    safeFreeCustom(_simple_poll,avahi_simple_poll_free);
+    cleanup_avahi();
 }
 
 void WIFIDeviceManager::device_add(std::shared_ptr<WIFIDevice> dev, bool notify){
     dev->_selfref = dev;
-    _children.insert(dev.get());
+    {
+        std::unique_lock<std::mutex> ul(_childrenLck);
+        _children.insert(dev.get());
+    }
     _mux->add_device(dev, notify);
 }
 
 
 bool WIFIDeviceManager::loopEvent(){
-    int err = avahi_simple_poll_loop(_simple_poll); //it's fine if this is blocking
-    debug("WIFIDeviceManager avahi main loop finished");
-    return err == 0;
+    while (true) {
+        if (!_simple_poll) {
+            try {
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                init_avahi();
+            } catch (tihmstar::exception &e) {
+                if (_isStopping) {
+                    return true;
+                }
+                error("Failed to initialize avahi discovery with error=%d (%s)", e.code(), e.what());
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                continue;
+            }
+        }
+
+        _shouldRestart = false;
+        int err = avahi_simple_poll_loop(_simple_poll);
+        if (_isStopping) {
+            debug("WIFIDeviceManager avahi main loop stopping");
+            return true;
+        }
+
+        if (!_shouldRestart && err == 0) {
+            debug("WIFIDeviceManager avahi main loop finished without restart request");
+            return true;
+        }
+
+        warning("WIFIDeviceManager avahi loop exited err=%d restart=%s; reinitializing discovery", err, _shouldRestart ? "YES" : "NO");
+        cleanup_avahi();
+    }
 }
 
 void WIFIDeviceManager::stopAction() noexcept{
-    avahi_simple_poll_quit(_simple_poll);
+    _isStopping = true;
+    if (_simple_poll) {
+        avahi_simple_poll_quit(_simple_poll);
+    }
 }
 
 void WIFIDeviceManager::reaper_runloop(){
@@ -104,14 +131,50 @@ void WIFIDeviceManager::reaper_runloop(){
     }
 }
 
+void WIFIDeviceManager::init_avahi(){
+    int err = 0;
+
+    assure(_simple_poll = avahi_simple_poll_new());
+    retassure(_avahi_client = avahi_client_new(avahi_simple_poll_get(_simple_poll), (AvahiClientFlags)0, avahi_client_callback, this, &err),
+        "Failed to start avahi_client with error=%d. Is the daemon running?",err);
+    assure(!err);
+
+    assure(_avahi_sb = avahi_service_browser_new(_avahi_client, AVAHI_IF_UNSPEC, AVAHI_PROTO_UNSPEC, "_apple-mobdev2._tcp", NULL, (AvahiLookupFlags)0, avahi_browse_callback, this));
+    assure(_avahi_sb2 = avahi_service_browser_new(_avahi_client, AVAHI_IF_UNSPEC, AVAHI_PROTO_UNSPEC, "_remotepairing-manual-pairing._tcp", NULL, (AvahiLookupFlags)0, avahi_browse_callback, this));
+    debug("WIFIDeviceManager created avahi service_browser for wifi rediscovery");
+}
+
+void WIFIDeviceManager::cleanup_avahi() noexcept{
+    safeFreeCustom(_avahi_sb,avahi_service_browser_free);
+    safeFreeCustom(_avahi_sb2,avahi_service_browser_free);
+    safeFreeCustom(_avahi_client,avahi_client_free);
+    safeFreeCustom(_simple_poll,avahi_simple_poll_free);
+}
+
+void WIFIDeviceManager::request_restart() noexcept{
+    _shouldRestart = true;
+    if (_simple_poll) {
+        avahi_simple_poll_quit(_simple_poll);
+    }
+}
+
+void WIFIDeviceManager::request_device_rediscovery(const char *serial, const char *serviceName) noexcept{
+    if (_isStopping) {
+        debug("Ignoring avahi rediscovery request during shutdown serial=%s service=%s", serial ? serial : "<null>", serviceName ? serviceName : "<null>");
+        return;
+    }
+    warning("WIFIDeviceManager requesting avahi rediscovery after wifi device loss serial=%s service=%s", serial ? serial : "<null>", serviceName ? serviceName : "<null>");
+    request_restart();
+}
+
 #pragma mark avahi_callback implementations
 
 void avahi_client_callback(AvahiClient *c, AvahiClientState state, void *userdata) noexcept{
    WIFIDeviceManager *devmgr = (WIFIDeviceManager*)userdata;
    /* Called whenever the client or server state changes */
    if (state == AVAHI_CLIENT_FAILURE) {
-       debug("Server connection failure: %s\n", avahi_strerror(avahi_client_errno(c)));
-       avahi_simple_poll_quit(devmgr->_simple_poll);
+       warning("Server connection failure: %s", avahi_strerror(avahi_client_errno(c)));
+       devmgr->request_restart();
    }
 }
 
@@ -121,11 +184,11 @@ void avahi_browse_callback(AvahiServiceBrowser *b, AvahiIfIndex interface, Avahi
 
    switch (event) {
    case AVAHI_BROWSER_FAILURE:
-       debug("(Browser) %s\n", avahi_strerror(avahi_client_errno(avahi_service_browser_get_client(b))));
-       avahi_simple_poll_quit(devmgr->_simple_poll);
+       warning("(Browser) %s", avahi_strerror(avahi_client_errno(avahi_service_browser_get_client(b))));
+       devmgr->request_restart();
        return;
    case AVAHI_BROWSER_NEW:
-       debug("(Browser) NEW: service '%s' of type '%s' in domain '%s'\n", name, type, domain);
+       debug("(Browser) NEW: service '%s' of type '%s' in domain '%s' interface=%d proto=%d", name, type, domain, interface, protocol);
        /* We ignore the returned resolver object. In the callback
           function we free it. If the server is terminated before
           the callback function is called the server will free
@@ -134,8 +197,13 @@ void avahi_browse_callback(AvahiServiceBrowser *b, AvahiIfIndex interface, Avahi
            debug("Failed to resolve service '%s': %s\n", name, avahi_strerror(avahi_client_errno(devmgr->_avahi_client)));
        break;
    case AVAHI_BROWSER_REMOVE:
-       debug("(Browser) REMOVE: service '%s' of type '%s' in domain '%s'\n", name, type, domain);
-       break;
+        warning("(Browser) REMOVE: service '%s' of type '%s' in domain '%s' interface=%d proto=%d", name, type, domain, interface, protocol);
+        if (type && strstr(type, "_remotepairing-manual-pairing._tcp")) {
+            std::string serial = std::string("WIFIPAIR-") + name;
+            warning("(Browser) REMOVE pairing service cleanup serial=%s", serial.c_str());
+            devmgr->_mux->delete_wifi_device_with_serial(serial);
+        }
+        break;
    case AVAHI_BROWSER_ALL_FOR_NOW:
    case AVAHI_BROWSER_CACHE_EXHAUSTED:
        debug("(Browser) %s\n", event == AVAHI_BROWSER_CACHE_EXHAUSTED ? "CACHE_EXHAUSTED" : "ALL_FOR_NOW");
@@ -155,11 +223,11 @@ void avahi_resolve_callback(AvahiServiceResolver *r, AvahiIfIndex interface, Ava
     /* Called whenever a service has been resolved successfully or timed out */
     switch (event) {
         case AVAHI_RESOLVER_FAILURE:
-            debug("(Resolver) Failed to resolve service '%s' of type '%s' in domain '%s': %s\n", name, type, domain, avahi_strerror(avahi_client_errno(avahi_service_resolver_get_client(r))));
+            warning("(Resolver) Failed to resolve service '%s' of type '%s' in domain '%s': %s", name, type, domain, avahi_strerror(avahi_client_errno(avahi_service_resolver_get_client(r))));
             break;
         case AVAHI_RESOLVER_FOUND: {
             // TODO: inform muxer about devices leaving
-            debug("Service '%s' of type '%s' in domain '%s':\n", name, type, domain);
+            debug("(Resolver) FOUND service '%s' of type '%s' in domain '%s' host='%s' interface=%d proto=%d", name, type, domain, host_name ? host_name : "<null>", interface, protocol);
             avahi_address_snprint(addr, sizeof(addr), address);
             t = avahi_string_list_to_string(txt);
             std::string serviceName{name};
@@ -174,7 +242,10 @@ void avahi_resolve_callback(AvahiServiceResolver *r, AvahiIfIndex interface, Ava
             if (strstr(serviceName.c_str(), "_remotepairing-manual-pairing._tcp")) {
                 uuid = "WIFIPAIR-"+serviceName.substr(0,serviceName.find("."));
                 macAddr = {};
-                if (devmgr->_mux->have_wifi_device_with_ip(addrs)) goto error;
+                if (devmgr->_mux->have_wifi_device_with_ip(addrs)) {
+                    debug("Skipping pairing wifi device rediscovery for service='%s' ip='%s' because device with ip already exists", serviceName.c_str(), addrs.size() ? addrs.front().c_str() : "<none>");
+                    goto error;
+                }
                 notifyadd = false;
             }else{
                 try{
@@ -184,7 +255,13 @@ void avahi_resolve_callback(AvahiServiceResolver *r, AvahiIfIndex interface, Ava
                     break;
                 }
 
-                if (devmgr->_mux->have_wifi_device_with_mac(macAddr)) goto error;
+                if (auto existing = devmgr->_mux->get_wifi_device_with_serial(uuid)) {
+                    warning("Updating existing wifi device serial=%s service='%s' ip='%s'", uuid.c_str(), serviceName.c_str(), addrs.size() ? addrs.front().c_str() : "<none>");
+                    existing->updateDiscoveryInfo(addrs, serviceName, interface);
+                    existing->setRediscoverOnDestruct(true);
+                    existing->ensureSession();
+                    goto error;
+                }
                 devmgr->_mux->delete_wifi_pairing_device_with_ip(addrs);
                 notifyadd = true;
             }
@@ -192,6 +269,7 @@ void avahi_resolve_callback(AvahiServiceResolver *r, AvahiIfIndex interface, Ava
             {
                 std::shared_ptr<WIFIDevice> dev = nullptr;
                 try{
+                    warning("Adding wifi device from avahi discovery serial=%s service='%s' ip='%s' notify=%s", uuid.c_str(), serviceName.c_str(), addrs.size() ? addrs.front().c_str() : "<none>", notifyadd ? "YES" : "NO");
                     dev = std::make_shared<WIFIDevice>(devmgr->_mux, devmgr, uuid, addrs, serviceName, interface);
                     devmgr->device_add(dev, notifyadd); dev = NULL;
                 } catch (tihmstar::exception &e){

@@ -18,6 +18,8 @@
 #include <netdb.h>
 #include <sys/select.h>
 #include <unistd.h>
+#include <algorithm>
+#include <chrono>
 
 #pragma mark definitions
 
@@ -40,6 +42,18 @@
 void getaddr_reply(DNSServiceRef sdRef, DNSServiceFlags flags, uint32_t interfaceIndex, DNSServiceErrorType errorCode, const char *hostname, const struct sockaddr *address, uint32_t ttl, void *context) noexcept{
     int err = 0;
     WIFIDeviceManager *devmgr = (WIFIDeviceManager *)context;
+
+    if (errorCode) {
+        error("getaddr_reply failed with DNSService error=%d", errorCode);
+        devmgr->request_restart();
+        goto error;
+    }
+
+    if (!address) {
+        error("getaddr_reply received null address");
+        devmgr->request_restart();
+        goto error;
+    }
     
     std::vector<std::string> &addrs = devmgr->_clientAddrs[sdRef];
 
@@ -71,7 +85,13 @@ void getaddr_reply(DNSServiceRef sdRef, DNSServiceFlags flags, uint32_t interfac
             }catch (tihmstar::exception &e){
                 creterror("failed to find uuid for mac=%s with error=%d (%s)",macAddr.c_str(),e.code(),e.what());
             }
-            if (devmgr->_mux->have_wifi_device_with_mac(macAddr)) goto error;
+            if (auto existing = devmgr->_mux->get_wifi_device_with_serial(uuid)) {
+                warning("Updating existing wifi device serial=%s service='%s' ip='%s'", uuid.c_str(), serviceName.c_str(), addrs.size() ? addrs.front().c_str() : "<none>");
+                existing->updateDiscoveryInfo(addrs, serviceName, interfaceIndex);
+                existing->setRediscoverOnDestruct(true);
+                existing->ensureSession();
+                goto error;
+            }
             devmgr->_mux->delete_wifi_pairing_device_with_ip(addrs);
             notifyadd = true;
         }
@@ -107,18 +127,21 @@ void resolve_reply(DNSServiceRef sdRef, DNSServiceFlags flags, uint32_t interfac
     DNSServiceRef resolvClient = NULL;
     int resolvfd = -1;
 
+    if (errorCode) {
+        error("resolve_reply failed with DNSService error=%d", errorCode);
+        devmgr->request_restart();
+        return;
+    }
+
     cassure(!(res = DNSServiceGetAddrInfo(&resolvClient, 0, kDNSServiceInterfaceIndexAny, kDNSServiceProtocol_IPv4 | kDNSServiceProtocol_IPv6, hosttarget, getaddr_reply, context)));
     
     cassure((resolvfd = DNSServiceRefSockFD(resolvClient))>0);
-    devmgr->_pfds.push_back({
-        .fd = resolvfd,
-        .events = POLLIN
-    });
 
     devmgr->_clientAddrs[resolvClient] = {fullname};
     
     devmgr->_resolveClients.push_back(resolvClient);
     devmgr->_linkedClients[resolvClient] = sdRef;
+    devmgr->rebuild_pollfds();
     
 error:
     if (err) {
@@ -133,8 +156,19 @@ void browse_reply(DNSServiceRef sdref, const DNSServiceFlags flags, uint32_t ifI
     DNSServiceRef resolvClient = NULL;
     int resolvfd = -1;
 
+    if (errorCode) {
+        error("browse_reply failed with DNSService error=%d", errorCode);
+        devmgr->request_restart();
+        return;
+    }
+
     if (!(flags & kDNSServiceFlagsAdd)) {
-//        debug("ignoring event=%d. We only care about Add events at the moment",flags);
+        warning("browse_reply remove/ignore flags=%u ifIndex=%u type=%s name=%s", flags, ifIndex, replyType, replyName);
+        if (replyType && strstr(replyType, "_remotepairing-manual-pairing._tcp")) {
+            std::string serial = std::string("WIFIPAIR-") + replyName;
+            warning("browse_reply pairing remove cleanup serial=%s", serial.c_str());
+            devmgr->_mux->delete_wifi_device_with_serial(serial);
+        }
         return;
     }
     
@@ -145,14 +179,11 @@ void browse_reply(DNSServiceRef sdref, const DNSServiceFlags flags, uint32_t ifI
     cassure(!(res = DNSServiceResolve(&resolvClient, 0, kDNSServiceInterfaceIndexAny, replyName, replyType, replyDomain, resolve_reply, context)));
 
     cassure((resolvfd = DNSServiceRefSockFD(resolvClient))>0);
-    devmgr->_pfds.push_back({
-        .fd = resolvfd,
-        .events = POLLIN
-    });
 
 error:
     if (resolvClient){
         devmgr->_resolveClients.push_back(resolvClient);
+        devmgr->rebuild_pollfds();
     }
     if (err) {
         error("browse_reply failed with error=%d",err);
@@ -163,21 +194,11 @@ error:
 #pragma mark WIFIDevice
 
 WIFIDeviceManager::WIFIDeviceManager(Muxer *mux)
-: DeviceManager(mux), _client(NULL), _clientPairing(NULL), _dns_sd_fd(-1), _dns_sd_pairing_fd(-1), _wakePipe{}
+: DeviceManager(mux), _client(NULL), _clientPairing(NULL), _dns_sd_fd(-1), _dns_sd_pairing_fd(-1), _wakePipe{-1, -1}
+, _shouldRestart(false), _isStopping(false)
 {
-    int err = 0;
     debug("WIFIDeviceManager mDNS-client");
-    assure(!(err = DNSServiceBrowse(&_client, 0, kDNSServiceInterfaceIndexAny, "_apple-mobdev2._tcp", "", browse_reply, this)));
-    assure(!(err = DNSServiceBrowse(&_clientPairing, 0, kDNSServiceInterfaceIndexAny, "_remotepairing-manual-pairing._tcp", "", browse_reply, this)));
-
-    assure((_dns_sd_fd = DNSServiceRefSockFD(_client))>0);
-    _pfds.push_back({.fd = _dns_sd_fd, .events = POLLIN});
-
-    assure((_dns_sd_pairing_fd = DNSServiceRefSockFD(_clientPairing))>0);
-    _pfds.push_back({.fd = _dns_sd_pairing_fd, .events = POLLIN});
-
-    assure(!pipe(_wakePipe));
-    _pfds.push_back({.fd = _wakePipe[0], .events = POLLIN});
+    init_mdns();
     
     _devReaperThread = std::thread([this]{
         reaper_runloop();
@@ -200,80 +221,114 @@ WIFIDeviceManager::~WIFIDeviceManager(){
     }
     _reapDevices.kill();
     _devReaperThread.join();
-    {
-        for (auto rc : _resolveClients) 
-            safeFreeCustom(rc, DNSServiceRefDeallocate);
-        _resolveClients.clear();
-    }
-    safeFreeCustom(_client, DNSServiceRefDeallocate);
-    safeFreeCustom(_clientPairing, DNSServiceRefDeallocate);
-    safeClose(_wakePipe[0]);
-    safeClose(_wakePipe[1]);
+    cleanup_mdns();
 }
 
 void WIFIDeviceManager::device_add(std::shared_ptr<WIFIDevice> dev, bool notify){
     dev->_selfref = dev;
-    _children.insert(dev.get());
+    {
+        std::unique_lock<std::mutex> ul(_childrenLck);
+        _children.insert(dev.get());
+    }
     _mux->add_device(dev, notify);
 }
 
 bool WIFIDeviceManager::loopEvent(){
-    int res = 0;
-    res = poll(_pfds.data(), (int)_pfds.size(), -1);
-    if (res > 0){
-        cleanup([&]{
-            for (auto &rc : _removeClients) {
-                const auto target = std::remove(_resolveClients.begin(), _resolveClients.end(), rc);
-                if (target != _resolveClients.end()){
-                    DNSServiceRef tgt = *target;
-                    _resolveClients.erase(target, _resolveClients.end());
-                    DNSServiceRefDeallocate(tgt);
+    while (true) {
+        if (!_client || !_clientPairing || _wakePipe[0] < 0 || _wakePipe[1] < 0) {
+            try {
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                init_mdns();
+            } catch (tihmstar::exception &e) {
+                if (_isStopping) {
+                    return true;
                 }
+                error("Failed to initialize mDNS discovery with error=%d (%s)", e.code(), e.what());
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                continue;
             }
-            _removeClients.clear();
-            _pfds.clear();
-            {
-                _pfds.push_back({.fd = _dns_sd_fd, .events = POLLIN});
-                _pfds.push_back({.fd = _dns_sd_pairing_fd, .events = POLLIN});
-                _pfds.push_back({.fd = _wakePipe[0], .events = POLLIN});
-            }
-            for (auto c : _resolveClients) {
-                int cfd = DNSServiceRefSockFD(c);
-                if (cfd != -1){
-                    _pfds.push_back({.fd = cfd, .events = POLLIN});
-                }else{
-                    _removeClients.push_back(c);
+        }
+
+        int res = poll(_pfds.data(), (int)_pfds.size(), -1);
+        if (res > 0){
+            bool restartRequested = false;
+            cleanup([&]{
+                for (auto &rc : _removeClients) {
+                    const auto target = std::remove(_resolveClients.begin(), _resolveClients.end(), rc);
+                    if (target != _resolveClients.end()){
+                        DNSServiceRef tgt = *target;
+                        _resolveClients.erase(target, _resolveClients.end());
+                        DNSServiceRefDeallocate(tgt);
+                    }
                 }
-            }
-        });
-        DNSServiceErrorType err = 0;
-        auto cpy_pfds = _pfds;
-        for (auto pfd : cpy_pfds) {
-            if (pfd.revents & POLLIN) {
-                pfd.revents &= ~POLLIN;
-                if (pfd.fd == DNSServiceRefSockFD(_client)) {
-                    assure(!(err |= DNSServiceProcessResult(_client)));
-                }else if (pfd.fd == DNSServiceRefSockFD(_clientPairing)) {
-                    assure(!(err |= DNSServiceProcessResult(_clientPairing)));
-                }else{
-                    for (auto rc : _resolveClients) {
-                        int rcfd = DNSServiceRefSockFD(rc);
-                        if (rcfd == pfd.fd) {
-                            assure(!(err |= DNSServiceProcessResult(rc)));
-                            break;
+                _removeClients.clear();
+                rebuild_pollfds();
+            });
+            auto cpy_pfds = _pfds;
+            for (auto pfd : cpy_pfds) {
+                if (pfd.fd == _wakePipe[0] && (pfd.revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) {
+                    char buf[32];
+                    while (read(_wakePipe[0], buf, sizeof(buf)) > 0) {}
+                    restartRequested = _shouldRestart;
+                    continue;
+                }
+
+                if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                    warning("WIFIDeviceManager mDNS fd=%d signaled poll error events=0x%x", pfd.fd, pfd.revents);
+                    request_restart();
+                    restartRequested = true;
+                    continue;
+                }
+
+                if (pfd.revents & POLLIN) {
+                    DNSServiceErrorType err = 0;
+                    if (_client && pfd.fd == DNSServiceRefSockFD(_client)) {
+                        err = DNSServiceProcessResult(_client);
+                    }else if (_clientPairing && pfd.fd == DNSServiceRefSockFD(_clientPairing)) {
+                        err = DNSServiceProcessResult(_clientPairing);
+                    }else{
+                        for (auto rc : _resolveClients) {
+                            int rcfd = DNSServiceRefSockFD(rc);
+                            if (rcfd == pfd.fd) {
+                                err = DNSServiceProcessResult(rc);
+                                break;
+                            }
                         }
+                    }
+
+                    if (err) {
+                        error("DNSServiceProcessResult failed with error=%d", err);
+                        request_restart();
+                        restartRequested = true;
                     }
                 }
             }
+
+            if (_isStopping) {
+                debug("WIFIDeviceManager mDNS loop stopping");
+                return true;
+            }
+
+            if (restartRequested || _shouldRestart) {
+                warning("WIFIDeviceManager mDNS discovery restarting");
+                cleanup_mdns();
+                continue;
+            }
+        }else if (res != 0){
+            warning("poll() returned %d errno %d %s; restarting mDNS discovery", res, errno, strerror(errno));
+            request_restart();
+            cleanup_mdns();
+            continue;
         }
-    }else if (res != 0){
-        reterror("poll() returned %d errno %d %s\n", res, errno, strerror(errno));
     }
-    return true;
 }
 
 void WIFIDeviceManager::stopAction() noexcept{
-    safeClose(_wakePipe[1]);
+    _isStopping = true;
+    if (_wakePipe[1] >= 0) {
+        char wake = 'q';
+        (void)write(_wakePipe[1], &wake, 1);
+    }
 }
 
 void WIFIDeviceManager::reaper_runloop(){
@@ -287,6 +342,81 @@ void WIFIDeviceManager::reaper_runloop(){
         //make device go out of scope so it can die in piece
         dev->deconstruct();
     }
+}
+
+void WIFIDeviceManager::init_mdns(){
+    int err = 0;
+
+    if (_client || _clientPairing || _wakePipe[0] >= 0 || _wakePipe[1] >= 0) {
+        cleanup_mdns();
+    }
+
+    assure(!(err = DNSServiceBrowse(&_client, 0, kDNSServiceInterfaceIndexAny, "_apple-mobdev2._tcp", "", browse_reply, this)));
+    assure(!(err = DNSServiceBrowse(&_clientPairing, 0, kDNSServiceInterfaceIndexAny, "_remotepairing-manual-pairing._tcp", "", browse_reply, this)));
+
+    assure((_dns_sd_fd = DNSServiceRefSockFD(_client))>0);
+    assure((_dns_sd_pairing_fd = DNSServiceRefSockFD(_clientPairing))>0);
+
+    assure(!pipe(_wakePipe));
+    _shouldRestart = false;
+    rebuild_pollfds();
+    debug("WIFIDeviceManager created mDNS browsers");
+}
+
+void WIFIDeviceManager::cleanup_mdns() noexcept{
+    _pfds.clear();
+    _linkedClients.clear();
+    _clientAddrs.clear();
+    _removeClients.clear();
+    {
+        for (auto rc : _resolveClients)
+            safeFreeCustom(rc, DNSServiceRefDeallocate);
+        _resolveClients.clear();
+    }
+    safeFreeCustom(_client, DNSServiceRefDeallocate);
+    safeFreeCustom(_clientPairing, DNSServiceRefDeallocate);
+    _dns_sd_fd = -1;
+    _dns_sd_pairing_fd = -1;
+    safeClose(_wakePipe[0]);
+    safeClose(_wakePipe[1]);
+}
+
+void WIFIDeviceManager::rebuild_pollfds() noexcept{
+    _pfds.clear();
+    if (_dns_sd_fd >= 0) {
+        _pfds.push_back({.fd = _dns_sd_fd, .events = POLLIN});
+    }
+    if (_dns_sd_pairing_fd >= 0) {
+        _pfds.push_back({.fd = _dns_sd_pairing_fd, .events = POLLIN});
+    }
+    if (_wakePipe[0] >= 0) {
+        _pfds.push_back({.fd = _wakePipe[0], .events = POLLIN});
+    }
+    for (auto c : _resolveClients) {
+        int cfd = DNSServiceRefSockFD(c);
+        if (cfd != -1){
+            _pfds.push_back({.fd = cfd, .events = POLLIN});
+        }else{
+            _removeClients.push_back(c);
+        }
+    }
+}
+
+void WIFIDeviceManager::request_restart() noexcept{
+    _shouldRestart = true;
+    if (_wakePipe[1] >= 0) {
+        char wake = 'r';
+        (void)write(_wakePipe[1], &wake, 1);
+    }
+}
+
+void WIFIDeviceManager::request_device_rediscovery(const char *serial, const char *serviceName) noexcept{
+    if (_isStopping) {
+        debug("Ignoring mDNS rediscovery request during shutdown serial=%s service=%s", serial ? serial : "<null>", serviceName ? serviceName : "<null>");
+        return;
+    }
+    warning("WIFIDeviceManager requesting mDNS rediscovery after wifi device loss serial=%s service=%s", serial ? serial : "<null>", serviceName ? serviceName : "<null>");
+    request_restart();
 }
 
 #endif //HAVE_WIFI_MDNS

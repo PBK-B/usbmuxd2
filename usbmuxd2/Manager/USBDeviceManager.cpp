@@ -298,7 +298,9 @@ USBDeviceManager::~USBDeviceManager(){
         }
     }
     _reapDevices.kill();
-    _devReaperThread.join();
+    if (_devReaperThread.joinable()) {
+        _devReaperThread.join();
+    }
 
     stopLoop();
     safeFreeCustom(_ctx, libusb_exit);
@@ -533,5 +535,4 @@ void USBDeviceManager::reaper_runloop(){
 
 
 #pragma mark public
-
 
