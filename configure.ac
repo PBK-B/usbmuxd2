@@ -26,7 +26,6 @@ AC_MSG_CHECKING([whether we need platform-specific build settings])
 case $host_os in
   darwin* )
         CXXFLAGS+=" -stdlib=libc++"
-        have_mdns="yes"
         ;;
   *)
         ;;
@@ -56,6 +55,20 @@ PKG_CHECK_MODULES(libplist, $LIBPLIST_REQUIRES_STR)
 PKG_CHECK_MODULES(avahi, $AVAHI_REQUIRES_STR, have_avahi=yes, have_avahi=no)
 PKG_CHECK_MODULES(libimobiledevice, $LIBIMOBILEDEVICE_REQUIRES_STR, have_limd=yes, have_limd=no)
 
+have_mdns=no
+mdns_CFLAGS=""
+mdns_LIBS=""
+PKG_CHECK_MODULES(mdns, dns_sd, have_mdns=yes, [
+  AC_CHECK_HEADERS([dns_sd.h], [
+    AC_CHECK_LIB([dns_sd], [DNSServiceBrowse], [
+      have_mdns=yes
+      mdns_LIBS="-ldns_sd"
+    ], [have_mdns=no])
+  ], [have_mdns=no])
+])
+AC_SUBST(mdns_CFLAGS)
+AC_SUBST(mdns_LIBS)
+
 #Debian Dependencies
 LIBGENERAL_DEBIAN_DEP_STR="libgeneral0 (>= 0.$LIBGENERAL_MINVERS_STR),"
 LIBUSB_DEBIAN_DEP_STR="libusb-1.0-0 (>= 2:$LIBUSB_MINVERS_STR),"
@@ -78,6 +91,12 @@ AC_ARG_WITH([wifi],
             [do not build with wifi support @<:@default=yes@:>@])],
             [with_wifi=no],
             [with_wifi=yes])
+
+AC_ARG_WITH([wifi-backend],
+            [AS_HELP_STRING([--with-wifi-backend=auto|avahi|mdns],
+            [select wifi discovery backend @<:@default=auto@:>@])],
+            [with_wifi_backend="$withval"],
+            [with_wifi_backend="auto"])
 
 AC_ARG_ENABLE([debug],
             [AS_HELP_STRING([--enable-debug],
@@ -109,20 +128,54 @@ fi
 AC_SUBST([libimobiledevice_debian_dep], [$LIBIMOBILEDEVICE_DEBIAN_DEP_STR])
 
 if test "x$with_wifi" == "xyes"; then
-  if test "x$have_avahi" = "xyes"; then
+  case "x$with_wifi_backend" in
+    xauto)
+      if test "x$have_avahi" = "xyes"; then
+        wifi_backend="avahi"
+      elif test "x$have_mdns" = "xyes"; then
+        wifi_backend="mdns"
+      else
+        AC_MSG_ERROR([wifi support requested but no wifi backend could be found])
+      fi
+      ;;
+    xavahi)
+      if test "x$have_avahi" != "xyes"; then
+        AC_MSG_ERROR([wifi backend 'avahi' requested but avahi-client development files were not found])
+      fi
+      wifi_backend="avahi"
+      ;;
+    xmdns)
+      if test "x$have_mdns" != "xyes"; then
+        AC_MSG_ERROR([wifi backend 'mdns' requested but libdns_sd was not found])
+      fi
+      wifi_backend="mdns"
+      ;;
+    *)
+      AC_MSG_ERROR([unknown wifi backend '$with_wifi_backend' (expected auto|avahi|mdns)])
+      ;;
+  esac
+
+  if test "x$wifi_backend" = "xavahi"; then
     AC_DEFINE(HAVE_WIFI_AVAHI, 1, [Define if you have avahi])
-    AC_SUBST(avahi_CFLAGS)
-    AC_SUBST(avahi_LIBS)
-  elif test "x$have_mdns" = "xyes"; then
+    wifi_backend_CFLAGS="$avahi_CFLAGS"
+    wifi_backend_LIBS="$avahi_LIBS"
+  elif test "x$wifi_backend" = "xmdns"; then
     AVAHI_DEBIAN_DEP_STR=""
     AC_DEFINE(HAVE_WIFI_MDNS, 1, [Define if you have mDNS])
-  else
-    AC_MSG_ERROR([wifi support requested but no wifi backend could not be found])
+    wifi_backend_CFLAGS="$mdns_CFLAGS"
+    wifi_backend_LIBS="$mdns_LIBS"
   fi
 else
   AVAHI_DEBIAN_DEP_STR=""
+  wifi_backend="disabled"
+  wifi_backend_CFLAGS=""
+  wifi_backend_LIBS=""
   echo "*** Note: wifi support has been disabled ***"
 fi
+AC_SUBST(wifi_backend_CFLAGS)
+AC_SUBST(wifi_backend_LIBS)
+AM_CONDITIONAL(USE_WIFI_AVAHI, [test "x$wifi_backend" = "xavahi"])
+AM_CONDITIONAL(USE_WIFI_MDNS, [test "x$wifi_backend" = "xmdns"])
 AC_SUBST([avahi_debian_dep], [$AVAHI_DEBIAN_DEP_STR])
 
 AC_ARG_WITH([udevrulesdir],
@@ -236,11 +289,7 @@ Configuration for $PACKAGE-$VERSION:
   activation method .......: $activation_method"
 
 if test "x$with_wifi" = "xyes"; then
-  if test "x$have_avahi" = "xyes"; then
-    echo "  WIFI backend ............: avahi"
-  elif test "x$have_mdns" = "xyes"; then
-    echo "  WIFI backend ............: mDNS"
-  fi
+  echo "  WIFI backend ............: $wifi_backend"
 fi
 
 if test "x$activation_method" = "xsystemd"; then

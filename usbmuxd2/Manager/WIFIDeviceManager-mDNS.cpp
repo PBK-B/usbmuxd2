@@ -18,6 +18,7 @@
 #include <netdb.h>
 #include <sys/select.h>
 #include <unistd.h>
+#include <algorithm>
 
 #pragma mark definitions
 

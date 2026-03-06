@@ -1,6 +1,6 @@
 AM_CFLAGS = -I$(top_srcdir)/usbmuxd2 $(GLOBAL_CFLAGS) $(libplist_CFLAGS) $(libusb_CFLAGS) $(libimobildevice_CFLAGS) $(libgeneral_CFLAGS)
-AM_CXXFLAGS = $(GLOBAL_CXXFLAGS) $(libplist_CXXFLAGS) $(avahi_CXXFLAGS)
-AM_LDFLAGS = $(libplist_LIBS) $(libusb_LIBS) $(libimobiledevice_LIBS) $(avahi_LIBS) $(libpthread_LIBS) $(libgeneral_LIBS)
+AM_CXXFLAGS = $(GLOBAL_CXXFLAGS) $(libplist_CXXFLAGS) $(wifi_backend_CFLAGS)
+AM_LDFLAGS = $(libplist_LIBS) $(libusb_LIBS) $(libimobiledevice_LIBS) $(wifi_backend_LIBS) $(libpthread_LIBS) $(libgeneral_LIBS)
 
 
 sbin_PROGRAMS = usbmuxd
@@ -20,7 +20,13 @@ usbmuxd_SOURCES = main.cpp \
 			Devices/USBDevice_receiver.cpp \
 			Devices/WIFIDevice.cpp \
 			Manager/USBDeviceManager.cpp \
-			Manager/WIFIDeviceManager-avahi.cpp \
-			Manager/WIFIDeviceManager-mDNS.cpp \
 			Manager/ClientManager.cpp \
 			Manager/DeviceManager.cpp
+
+if USE_WIFI_AVAHI
+usbmuxd_SOURCES += Manager/WIFIDeviceManager-avahi.cpp
+endif
+
+if USE_WIFI_MDNS
+usbmuxd_SOURCES += Manager/WIFIDeviceManager-mDNS.cpp
+endif
