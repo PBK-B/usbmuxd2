@@ -20,6 +20,8 @@
 #include <avahi-client/client.h>
 #include <avahi-client/lookup.h>
 
+#include <atomic>
+
 class WIFIDeviceManager : public DeviceManager{
 private:
     std::set<WIFIDevice *> _children;  //raw ptr to shared objec
@@ -32,6 +34,12 @@ private:
     AvahiClient *_avahi_client;
     AvahiServiceBrowser *_avahi_sb;
     AvahiServiceBrowser *_avahi_sb2;
+    std::atomic<bool> _shouldRestart;
+    std::atomic<bool> _isStopping;
+
+    void init_avahi();
+    void cleanup_avahi() noexcept;
+    void request_restart() noexcept;
 
     virtual bool loopEvent() override;
     virtual void stopAction() noexcept override;

@@ -18,6 +18,7 @@
 #include <avahi-common/malloc.h>
 #include <avahi-common/address.h>
 
+#include <chrono>
 #include <string.h>
 
 #pragma mark avahi_callback definitions
@@ -32,19 +33,15 @@ void avahi_resolve_callback(AvahiServiceResolver *r, AvahiIfIndex interface, Ava
 
 WIFIDeviceManager::WIFIDeviceManager(Muxer *mux)
 : DeviceManager(mux)
+, _simple_poll(nullptr)
+, _avahi_client(nullptr)
+, _avahi_sb(nullptr)
+, _avahi_sb2(nullptr)
+, _shouldRestart(false)
+, _isStopping(false)
 {
-   int err = 0;
    debug("WIFIDeviceManager avahi-client");
-
-   assure(_simple_poll = avahi_simple_poll_new());
-
-   retassure(_avahi_client = avahi_client_new(avahi_simple_poll_get(_simple_poll), (AvahiClientFlags)0, avahi_client_callback, this, &err),
-       "Failed to start avahi_client with error=%d. Is the daemon running?",err);
-   assure(!err);
-
-   assure(_avahi_sb = avahi_service_browser_new(_avahi_client, AVAHI_IF_UNSPEC, AVAHI_PROTO_UNSPEC, "_apple-mobdev2._tcp", NULL, (AvahiLookupFlags)0, avahi_browse_callback, this));
-   assure(_avahi_sb2 = avahi_service_browser_new(_avahi_client, AVAHI_IF_UNSPEC, AVAHI_PROTO_UNSPEC, "_remotepairing-manual-pairing._tcp", NULL, (AvahiLookupFlags)0, avahi_browse_callback, this));
-   debug("WIFIDeviceManager created avahi service_browser");
+   init_avahi();
 
     _devReaperThread = std::thread([this]{
         reaper_runloop();
@@ -68,10 +65,7 @@ WIFIDeviceManager::~WIFIDeviceManager(){
     _reapDevices.kill();
     _devReaperThread.join();
 
-    safeFreeCustom(_avahi_sb,avahi_service_browser_free);
-    safeFreeCustom(_avahi_sb2,avahi_service_browser_free);
-    safeFreeCustom(_avahi_client,avahi_client_free);
-    safeFreeCustom(_simple_poll,avahi_simple_poll_free);
+    cleanup_avahi();
 }
 
 void WIFIDeviceManager::device_add(std::shared_ptr<WIFIDevice> dev, bool notify){
@@ -82,13 +76,44 @@ void WIFIDeviceManager::device_add(std::shared_ptr<WIFIDevice> dev, bool notify)
 
 
 bool WIFIDeviceManager::loopEvent(){
-    int err = avahi_simple_poll_loop(_simple_poll); //it's fine if this is blocking
-    debug("WIFIDeviceManager avahi main loop finished");
-    return err == 0;
+    while (true) {
+        if (!_simple_poll) {
+            try {
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                init_avahi();
+            } catch (tihmstar::exception &e) {
+                if (_isStopping) {
+                    return true;
+                }
+                error("Failed to initialize avahi discovery with error=%d (%s)", e.code(), e.what());
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                continue;
+            }
+        }
+
+        _shouldRestart = false;
+        int err = avahi_simple_poll_loop(_simple_poll); // it's fine if this is blocking
+
+        if (_isStopping) {
+            debug("WIFIDeviceManager avahi main loop stopping");
+            return true;
+        }
+
+        if (!_shouldRestart && err == 0) {
+            debug("WIFIDeviceManager avahi main loop finished without restart request");
+            return true;
+        }
+
+        warning("WIFIDeviceManager avahi loop exited err=%d restart=%s; reinitializing discovery", err, _shouldRestart ? "YES" : "NO");
+        cleanup_avahi();
+    }
 }
 
 void WIFIDeviceManager::stopAction() noexcept{
-    avahi_simple_poll_quit(_simple_poll);
+    _isStopping = true;
+    if (_simple_poll) {
+        avahi_simple_poll_quit(_simple_poll);
+    }
 }
 
 void WIFIDeviceManager::reaper_runloop(){
@@ -104,15 +129,43 @@ void WIFIDeviceManager::reaper_runloop(){
     }
 }
 
+void WIFIDeviceManager::init_avahi(){
+    int err = 0;
+
+    assure(_simple_poll = avahi_simple_poll_new());
+
+    retassure(_avahi_client = avahi_client_new(avahi_simple_poll_get(_simple_poll), (AvahiClientFlags)0, avahi_client_callback, this, &err),
+        "Failed to start avahi_client with error=%d. Is the daemon running?", err);
+    assure(!err);
+
+    assure(_avahi_sb = avahi_service_browser_new(_avahi_client, AVAHI_IF_UNSPEC, AVAHI_PROTO_UNSPEC, "_apple-mobdev2._tcp", NULL, (AvahiLookupFlags)0, avahi_browse_callback, this));
+    assure(_avahi_sb2 = avahi_service_browser_new(_avahi_client, AVAHI_IF_UNSPEC, AVAHI_PROTO_UNSPEC, "_remotepairing-manual-pairing._tcp", NULL, (AvahiLookupFlags)0, avahi_browse_callback, this));
+    debug("WIFIDeviceManager created avahi service_browser");
+}
+
+void WIFIDeviceManager::cleanup_avahi() noexcept{
+    safeFreeCustom(_avahi_sb,avahi_service_browser_free);
+    safeFreeCustom(_avahi_sb2,avahi_service_browser_free);
+    safeFreeCustom(_avahi_client,avahi_client_free);
+    safeFreeCustom(_simple_poll,avahi_simple_poll_free);
+}
+
+void WIFIDeviceManager::request_restart() noexcept{
+    _shouldRestart = true;
+    if (_simple_poll) {
+        avahi_simple_poll_quit(_simple_poll);
+    }
+}
+
 #pragma mark avahi_callback implementations
 
 void avahi_client_callback(AvahiClient *c, AvahiClientState state, void *userdata) noexcept{
    WIFIDeviceManager *devmgr = (WIFIDeviceManager*)userdata;
    /* Called whenever the client or server state changes */
-   if (state == AVAHI_CLIENT_FAILURE) {
-       debug("Server connection failure: %s\n", avahi_strerror(avahi_client_errno(c)));
-       avahi_simple_poll_quit(devmgr->_simple_poll);
-   }
+    if (state == AVAHI_CLIENT_FAILURE) {
+       warning("Server connection failure: %s", avahi_strerror(avahi_client_errno(c)));
+       devmgr->request_restart();
+    }
 }
 
 void avahi_browse_callback(AvahiServiceBrowser *b, AvahiIfIndex interface, AvahiProtocol protocol, AvahiBrowserEvent event,
@@ -121,8 +174,8 @@ void avahi_browse_callback(AvahiServiceBrowser *b, AvahiIfIndex interface, Avahi
 
    switch (event) {
    case AVAHI_BROWSER_FAILURE:
-       debug("(Browser) %s\n", avahi_strerror(avahi_client_errno(avahi_service_browser_get_client(b))));
-       avahi_simple_poll_quit(devmgr->_simple_poll);
+       warning("(Browser) %s", avahi_strerror(avahi_client_errno(avahi_service_browser_get_client(b))));
+       devmgr->request_restart();
        return;
    case AVAHI_BROWSER_NEW:
        debug("(Browser) NEW: service '%s' of type '%s' in domain '%s'\n", name, type, domain);
