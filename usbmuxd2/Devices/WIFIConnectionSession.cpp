@@ -14,6 +14,7 @@
 #include <libimobiledevice/heartbeat.h>
 #include <plist/plist.h>
 
+#include <cstring>
 #include <thread>
 
 WIFIConnectionSession::WIFIConnectionSession(std::shared_ptr<WIFIDevice> device)
@@ -89,6 +90,8 @@ void WIFIConnectionSession::runloop() noexcept{
         bool connected = runAttempt(dev);
         if (connected) {
             _state = State::Connected;
+            backoffIdx = 0;
+            bool sleepyTimeReceived = false;
             plist_t hbrsp = nullptr;
             plist_t hbeat = nullptr;
             assure(hbrsp = plist_new_dict());
@@ -96,9 +99,25 @@ void WIFIConnectionSession::runloop() noexcept{
             while (!_stopRequested) {
                 heartbeat_error_t hret = heartbeat_receive_with_timeout(_hbclient, &hbeat, 15000);
                 if (hret != HEARTBEAT_E_SUCCESS) {
-                    warning("[WIFIConnectionSession] heartbeat receive failed serial=%s error=%d", dev->_serial, hret);
+                    if (sleepyTimeReceived) {
+                        warning("[WIFIConnectionSession] device sleeping, will reconnect later serial=%s", dev->_serial);
+                    } else {
+                        warning("[WIFIConnectionSession] heartbeat receive failed serial=%s error=%d", dev->_serial, hret);
+                    }
                     break;
                 }
+
+                // Detect if the device is entering sleep mode
+                plist_t cmdNode = hbeat ? plist_dict_get_item(hbeat, "Command") : nullptr;
+                if (cmdNode) {
+                    const char *cmdVal = plist_get_string_ptr(cmdNode, nullptr);
+                    if (cmdVal && strcmp(cmdVal, "SleepyTime") == 0) {
+                        sleepyTimeReceived = true;
+                    } else {
+                        sleepyTimeReceived = false;
+                    }
+                }
+
                 hret = heartbeat_send(_hbclient, hbrsp);
                 safeFreeCustom(hbeat, plist_free);
                 if (hret != HEARTBEAT_E_SUCCESS) {
@@ -111,6 +130,16 @@ void WIFIConnectionSession::runloop() noexcept{
 
             if (_stopRequested) {
                 break;
+            }
+
+            // Device entered sleep normally: skip kill/backoff, wait then reconnect
+            if (sleepyTimeReceived) {
+                _state = State::Retrying;
+                static constexpr auto sleepReconnectDelay = std::chrono::seconds(60);
+                warning("[WIFIConnectionSession] device entered sleep, waiting %llds before reconnect serial=%s",
+                        (long long)std::chrono::duration_cast<std::chrono::seconds>(sleepReconnectDelay).count(), dev->_serial);
+                std::this_thread::sleep_for(sleepReconnectDelay);
+                continue;
             }
 
             if (!dev->_mux->allowHeartlessWifi()) {
