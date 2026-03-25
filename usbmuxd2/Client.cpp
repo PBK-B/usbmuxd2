@@ -311,11 +311,13 @@ void Client::processData(const usbmuxd_header *hdr){
 
                     plist_get_uint_val(p_intval, &intval);
                     _mux->notify_device_paired((int)intval);
-                }catch (tihmstar::exception &e){
-                    debug("Failed to notify about successfully pairing of '%s'",record_id.c_str());
-                }
+            }catch (tihmstar::exception &e){
+                debug("Failed to notify about successfully pairing of '%s'",record_id.c_str());
+            }
 
-                send_result(hdr->tag, RESULT_OK);
+            _mux->trigger_wifi_rediscovery_after_pairing(record_id.c_str());
+
+            send_result(hdr->tag, RESULT_OK);
                 return;
             } else if (message == "DeletePairRecord") {
                 std::string record_id;

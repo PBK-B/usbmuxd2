@@ -467,6 +467,14 @@ void Muxer::notify_device_paired(int deviceID) noexcept{
     }
 }
 
+void Muxer::trigger_wifi_rediscovery_after_pairing(const char *udid) noexcept{
+#if defined(HAVE_WIFI_AVAHI) || defined(HAVE_WIFI_MDNS)
+    if (_wifidevmgr) {
+        _wifidevmgr->request_rediscovery_after_pairing(udid);
+    }
+#endif
+}
+
 void Muxer::notify_alldevices(std::shared_ptr<Client> cli) noexcept {
     debug("notify_alldevices(%d)",cli->_fd);
     if (!cli->_isListening) {

@@ -410,6 +410,15 @@ void WIFIDeviceManager::request_restart() noexcept{
     }
 }
 
+void WIFIDeviceManager::request_rediscovery_after_pairing(const char *udid) noexcept{
+    if (_isStopping) {
+        debug("Ignoring mDNS rediscovery-after-pairing request during shutdown udid=%s", udid ? udid : "<null>");
+        return;
+    }
+    warning("WIFIDeviceManager requesting mDNS rediscovery after new pairing udid=%s", udid ? udid : "<null>");
+    request_restart();
+}
+
 void WIFIDeviceManager::request_device_rediscovery(const char *serial, const char *serviceName) noexcept{
     if (_isStopping) {
         debug("Ignoring mDNS rediscovery request during shutdown serial=%s service=%s", serial ? serial : "<null>", serviceName ? serviceName : "<null>");

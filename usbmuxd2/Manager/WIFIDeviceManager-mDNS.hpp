@@ -131,6 +131,7 @@ public:
         
     void device_add(std::shared_ptr<WIFIDevice> dev, bool notify = true);
     void request_device_rediscovery(const char *serial, const char *serviceName) noexcept;
+    void request_rediscovery_after_pairing(const char *udid) noexcept;
     
     friend WIFIDevice;
     friend void browse_reply(DNSServiceRef sdref, const DNSServiceFlags flags, uint32_t ifIndex, DNSServiceErrorType errorCode, const char *replyName, const char *replyType, const char *replyDomain, void *context) noexcept;
